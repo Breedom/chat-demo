@@ -21,8 +21,8 @@ import type {
  * 发送前 streamReply 会先补齐 serverId；仍为 null 的是本地没有原件的附件，不进入请求。
  */
 const toFileBlocks = (files: FileAttachment[]): FileBlockParam[] =>
-  files.flatMap(({ serverId, isImage }) =>
-    serverId
+  files.flatMap(({ serverId, isImage, compatibleScope }) =>
+    serverId && compatibleScope === undefined
       ? [
           {
             type: isImage ? 'image' : 'document',
@@ -298,18 +298,20 @@ export const getContextRounds = (history: Message[]): [UserMessage, AssistantMes
 
 export const toOpenAIRequestMessages = (
   history: Message[],
-  question: UserMessage
+  question: UserMessage,
+  contents?: {
+    current: OpenAIMessage['content']
+    history: OpenAIMessage['content'][]
+  }
 ): OpenAIMessage[] => {
   const messages: OpenAIMessage[] = []
-  for (const [user, reply] of getContextRounds(history)) {
-    if (user.content.trim()) {
-      messages.push(
-        { role: 'user', content: user.content },
-        { role: 'assistant', content: getReplyText(reply) }
-      )
+  for (const [index, [user, reply]] of getContextRounds(history).entries()) {
+    const content = contents?.history[index] ?? user.content
+    if (typeof content !== 'string' || content.trim()) {
+      messages.push({ role: 'user', content }, { role: 'assistant', content: getReplyText(reply) })
     }
   }
-  messages.push({ role: 'user', content: question.content })
+  messages.push({ role: 'user', content: contents?.current ?? question.content })
   return messages
 }
 

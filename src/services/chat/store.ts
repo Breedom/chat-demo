@@ -12,9 +12,10 @@ import {
   useUploads,
 } from '../attachments.js'
 import { getChatConnection, useSettings } from '../settings.js'
-import { isConnectionReady, type ChatConnection } from '../providers.js'
+import { attachmentScope, isConnectionReady, type ChatConnection } from '../providers.js'
 import { appendBranch, getVisibleMessages, normalizeSession, selectVersion } from './branches.js'
 import * as db from './db.js'
+import { prepareCompatibleContent } from './compatibleFiles.js'
 import {
   clearAllDrafts,
   clearDraft,
@@ -559,8 +560,12 @@ export const sendMessage = (targetSessionId: string | null) => {
   if (get().importingHistory || !get().ready || !isConnectionReady(connection)) {
     return false
   }
-  const prepared = prepareDraftMessage(getDraft(targetSessionId), useUploads.getState().tasks)
-  if (!prepared || (connection.kind === 'compatible' && prepared.files.length > 0)) {
+  const prepared = prepareDraftMessage(
+    getDraft(targetSessionId),
+    useUploads.getState().tasks,
+    connection
+  )
+  if (!prepared) {
     return false
   }
   const { text, files } = prepared
@@ -601,8 +606,11 @@ export const sendMessage = (targetSessionId: string | null) => {
     files: files.map(({ id, serverId, name, size, isImage, mimeType }) => ({
       id,
       serverId,
+      ...(connection.kind === 'compatible'
+        ? { compatibleScope: attachmentScope(connection.provider) }
+        : {}),
       // 草稿附件已上传成功，每张图片都在上传前检查过长边，超限的已缩小。
-      imageSizeChecked: isImage,
+      imageSizeChecked: isImage && serverId !== null,
       name,
       size,
       isImage,
@@ -812,7 +820,16 @@ const saveServerIds = (sessionId: string, serverIds: ReadonlyMap<string, string 
  * 附件的服务端 id：已有直接用；正在上传的等待同一任务；否则读取本地原件补传。
  * 本地也没有原件（导入的文档附件只有元数据）时返回 null，该附件只展示、不进入请求。
  */
-const ensureServerId = async (apiKey: string, file: FileAttachment): Promise<string | null> => {
+const loadSessionFile = (sessionId: string, id: string) =>
+  Promise.resolve(
+    pendingFiles.get(sessionId)?.find((file) => file.id === id)?.blob ?? db.loadFile(id)
+  )
+
+const ensureServerId = async (
+  sessionId: string,
+  apiKey: string,
+  file: FileAttachment
+): Promise<string | null> => {
   if (file.serverId) {
     return file.serverId
   }
@@ -820,7 +837,7 @@ const ensureServerId = async (apiKey: string, file: FileAttachment): Promise<str
   if (task?.status === 'done') {
     return task.serverId
   }
-  const blob = await db.loadFile(file.id)
+  const blob = await loadSessionFile(sessionId, file.id)
   if (!blob) {
     return null
   }
@@ -868,7 +885,7 @@ const prepareFiles = async (
   const files = [
     ...request.question.files,
     ...getContextRounds(request.history).flatMap(([user]) => user.files),
-  ]
+  ].filter((file) => file.compatibleScope === undefined)
   const checked = await Promise.race([checkImageFileIds(files, signal), aborted])
   if (checked.size > 0) {
     saveServerIds(sessionId, checked)
@@ -876,7 +893,7 @@ const prepareFiles = async (
   }
   const uploads = Promise.allSettled(
     request.question.files.map(async (file) => {
-      const serverId = await ensureServerId(apiKey, file)
+      const serverId = await ensureServerId(sessionId, apiKey, file)
       if (serverId && serverId !== file.serverId) {
         serverIds.set(file.id, serverId)
       }
@@ -896,7 +913,12 @@ const prepareFiles = async (
   const pending = new Map<string, FileAttachment>()
   for (const [user] of getContextRounds(request.history).toReversed()) {
     for (const file of user.files) {
-      if (!file.serverId && !serverIds.has(file.id) && !pending.has(file.id)) {
+      if (
+        file.compatibleScope === undefined &&
+        !file.serverId &&
+        !serverIds.has(file.id) &&
+        !pending.has(file.id)
+      ) {
         pending.set(file.id, file)
       }
     }
@@ -904,7 +926,7 @@ const prepareFiles = async (
   for (const file of pending.values()) {
     signal.throwIfAborted()
     try {
-      const serverId = await Promise.race([ensureServerId(apiKey, file), aborted])
+      const serverId = await Promise.race([ensureServerId(sessionId, apiKey, file), aborted])
       if (serverId) {
         serverIds.set(file.id, serverId)
         saveServerIds(sessionId, new Map([[file.id, serverId]]))
@@ -1038,6 +1060,16 @@ const streamReply = async (
         const { signal } = controller
         let events
         if (connection.kind === 'deepseek') {
+          const foreignFile = request.question.files.find(
+            (file) => file.compatibleScope !== undefined
+          )
+          if (foreignFile) {
+            preparing = false
+            throw new ApiError('protocol', {
+              key: 'providerAttachmentScope',
+              params: { name: foreignFile.name },
+            })
+          }
           const apiKey = connection.apiKey ?? ''
           const prepared = await prepareFiles(apiKey, sessionId, request, signal)
           preparing = false
@@ -1069,12 +1101,16 @@ const streamReply = async (
             signal
           )
         } else {
-          if (request.question.files.length > 0) {
-            throw new ApiError('protocol', { key: 'providerAttachmentsUnsupported' })
-          }
+          const contents = await prepareCompatibleContent(
+            connection.provider,
+            getContextRounds(request.history).map(([user]) => user),
+            request.question,
+            (id) => loadSessionFile(sessionId, id),
+            signal
+          )
           events = streamOpenAI(
             connection,
-            toOpenAIRequestMessages(request.history, request.question),
+            toOpenAIRequestMessages(request.history, request.question, contents),
             signal
           )
         }
@@ -1106,7 +1142,12 @@ const streamReply = async (
           !signal.aborted &&
           !get().importingHistory
         ) {
-          const title = Array.from(request.question.content.trim().replace(/\s+/g, ' '))
+          const title = Array.from(
+            (request.question.content.trim() || request.question.files[0]?.name || '').replace(
+              /\s+/g,
+              ' '
+            )
+          )
             .slice(0, 40)
             .join('')
           updateSession(sessionId, (session) => (session.title ? session : { ...session, title }))

@@ -6,9 +6,12 @@ import {
   DEEPSEEK_PROVIDER,
   OPENAI_PRESET,
   OPENAI_PROVIDER,
+  attachmentScope,
+  getModelOptions,
   normalizeProvider,
   type ChatConnection,
   type CompatibleProvider,
+  type ReasoningChoice,
 } from './providers.js'
 
 export type Locale = 'zh-CN' | 'en-US'
@@ -19,9 +22,11 @@ export type ThemePreference = 'light' | 'dark' | 'system'
 /** 本机设置，存 localStorage：API Key、语言、主题、位置、朗读音色、深度思考与智能搜索开关、侧边栏收起状态 */
 type Settings = {
   apiKey: string | null
+  deepSeekModel: string
   activeProviderId: string
   compatibleProviders: CompatibleProvider[]
   compatibleKeys: ReadonlyMap<string, string>
+  reasoningOverrides: ReadonlyMap<string, ReasoningChoice>
   locale: Locale
   themePreference: ThemePreference
   location: UserLocation | null
@@ -33,6 +38,7 @@ type Settings = {
 
 const KEYS = {
   apiKey: 'chat-demo:api-key',
+  deepSeekModel: 'chat-demo:deepseek-model',
   activeProviderId: 'chat-demo:active-provider',
   compatibleProviders: 'chat-demo:compatible-providers',
   locale: 'chat-demo:locale',
@@ -124,10 +130,12 @@ export const useSettings = create<Settings>(() => {
   const selected = read(KEYS.activeProviderId)
   return {
     apiKey: read(KEYS.apiKey),
+    deepSeekModel: read(KEYS.deepSeekModel)?.trim() || DEEPSEEK_MODEL,
     activeProviderId:
       compatibleProviders.find(({ id }) => id === selected)?.id ?? DEEPSEEK_PROVIDER,
     compatibleProviders,
     compatibleKeys: new Map(),
+    reasoningOverrides: new Map(),
     locale: initialLocale(),
     location: initialLocation(),
     themePreference: initialThemePreference(),
@@ -140,9 +148,45 @@ export const useSettings = create<Settings>(() => {
 
 export const getChatConnection = (state = useSettings.getState()): ChatConnection => {
   const provider = state.compatibleProviders.find(({ id }) => id === state.activeProviderId)
-  return provider
-    ? { kind: 'compatible', provider, apiKey: state.compatibleKeys.get(provider.id) ?? null }
-    : { kind: 'deepseek', model: DEEPSEEK_MODEL, apiKey: state.apiKey }
+  if (!provider) {
+    return { kind: 'deepseek', model: state.deepSeekModel, apiKey: state.apiKey }
+  }
+  const effort = getReasoningChoice(provider, state)
+  return {
+    kind: 'compatible',
+    provider,
+    apiKey: state.compatibleKeys.get(provider.id) ?? null,
+    reasoningEffort: effort === 'default' ? undefined : effort,
+  }
+}
+
+const reasoningKey = (provider: CompatibleProvider) =>
+  JSON.stringify([attachmentScope(provider), provider.model])
+
+export const getReasoningChoice = (
+  provider: CompatibleProvider,
+  state = useSettings.getState()
+): ReasoningChoice => {
+  const options = getModelOptions(provider)
+  const override = state.reasoningOverrides.get(reasoningKey(provider))
+  return override === 'default' || (override && options.efforts.includes(override))
+    ? override
+    : options.defaultEffort
+}
+
+export const setReasoningChoice = (provider: CompatibleProvider, choice: ReasoningChoice) => {
+  if (choice !== 'default' && !getModelOptions(provider).efforts.includes(choice)) {
+    return
+  }
+  useSettings.setState((state) => ({
+    reasoningOverrides: new Map(state.reasoningOverrides).set(reasoningKey(provider), choice),
+  }))
+}
+
+export const setDeepSeekModel = (value: string) => {
+  const deepSeekModel = value.trim() || DEEPSEEK_MODEL
+  write(KEYS.deepSeekModel, deepSeekModel)
+  useSettings.setState({ deepSeekModel })
 }
 
 export const setActiveProvider = (id: string) => {
@@ -156,6 +200,23 @@ export const setActiveProvider = (id: string) => {
   useSettings.setState({ activeProviderId: id })
 }
 
+export const selectCompatibleModel = (id: string, model: string) => {
+  const state = useSettings.getState()
+  const provider = state.compatibleProviders.find((item) => item.id === id)
+  if (
+    !provider ||
+    (provider.model !== model && !provider.models?.some((item) => item.id === model))
+  ) {
+    return
+  }
+  const compatibleProviders = state.compatibleProviders.map((item) =>
+    item === provider ? { ...item, model } : item
+  )
+  write(KEYS.compatibleProviders, JSON.stringify(compatibleProviders))
+  write(KEYS.activeProviderId, id)
+  useSettings.setState({ compatibleProviders, activeProviderId: id })
+}
+
 export const saveCompatibleProvider = (input: CompatibleProvider, apiKey: string) => {
   const provider = normalizeProvider(input)
   if (!provider) {
@@ -167,6 +228,8 @@ export const saveCompatibleProvider = (input: CompatibleProvider, apiKey: string
     ? state.compatibleProviders.map((item) => (item.id === provider.id ? provider : item))
     : [...state.compatibleProviders, provider]
   const compatibleKeys = new Map(state.compatibleKeys)
+  const reasoningOverrides = new Map(state.reasoningOverrides)
+  reasoningOverrides.delete(reasoningKey(provider))
   if (apiKey.trim()) {
     compatibleKeys.set(provider.id, apiKey.trim())
   } else {
@@ -174,7 +237,12 @@ export const saveCompatibleProvider = (input: CompatibleProvider, apiKey: string
   }
   write(KEYS.compatibleProviders, JSON.stringify(compatibleProviders))
   write(KEYS.activeProviderId, provider.id)
-  useSettings.setState({ compatibleProviders, compatibleKeys, activeProviderId: provider.id })
+  useSettings.setState({
+    compatibleProviders,
+    compatibleKeys,
+    reasoningOverrides,
+    activeProviderId: provider.id,
+  })
   return true
 }
 

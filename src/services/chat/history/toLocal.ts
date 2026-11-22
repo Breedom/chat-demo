@@ -28,6 +28,7 @@ const time = (value: string) => Date.parse(value)
 const toFile = (file: FileEntry): FileAttachment => ({
   id: file.id,
   serverId: null,
+  ...(file.local_only ? { compatibleScope: '' } : {}),
   name: file.file_name,
   size: file.file_size,
   isImage: file.is_image,

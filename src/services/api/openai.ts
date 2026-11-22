@@ -1,12 +1,56 @@
-import type { ChatConnection } from '../providers.js'
-import { ApiError, isErrorBody, readErrorResponse, request } from './client.js'
+import { isOfficialOpenAI, normalizeBaseUrl, type ChatConnection } from '../providers.js'
+import { API_ORIGIN, ApiError, isErrorBody, readErrorResponse, request } from './client.js'
 import { readServerSentEvents } from './sse.js'
 import type { MessageStreamEvent, StopReason } from './types.js'
 
-export type OpenAIMessage = { role: 'user' | 'assistant'; content: string }
+export type OpenAIContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'video_url'; video_url: { url: string } }
+  | { type: 'file'; file: { filename: string; file_data: string } }
+
+export type OpenAIMessage =
+  | { role: 'user'; content: string | OpenAIContentPart[] }
+  | { role: 'assistant'; content: string }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value)
+
+export const listModelIds = async (
+  baseUrl: string,
+  apiKey: string,
+  signal: AbortSignal,
+  native = false
+): Promise<string[]> => {
+  const base = native ? API_ORIGIN.replace(/\/+$/, '') : normalizeBaseUrl(baseUrl)
+  if (!base) {
+    throw new ApiError('protocol', { key: 'providerInvalidUrl' })
+  }
+  if (!apiKey.trim() && (native || isOfficialOpenAI(base))) {
+    throw new ApiError('protocol', { key: 'providerMissingKey' })
+  }
+  const response = await request(`${base}/models`, {
+    headers: {
+      Accept: 'application/json',
+      ...(apiKey.trim() ? { Authorization: `Bearer ${apiKey.trim()}` } : {}),
+    },
+    credentials: 'omit',
+    redirect: 'error',
+    signal,
+  })
+  const payload: unknown = await response.json().catch(() => null)
+  signal.throwIfAborted()
+  if (!isRecord(payload) || !Array.isArray(payload.data)) {
+    throw new ApiError('protocol', { key: 'providerInvalidModelList' })
+  }
+  const ids = new Set<string>()
+  for (const item of payload.data as unknown[]) {
+    if (isRecord(item) && typeof item.id === 'string' && item.id.trim()) {
+      ids.add(item.id.trim())
+    }
+  }
+  return [...ids].sort((a, b) => a.localeCompare(b))
+}
 
 const stopReason = (value: string): StopReason => {
   switch (value) {
@@ -23,7 +67,7 @@ const stopReason = (value: string): StopReason => {
 }
 
 export async function* streamOpenAI(
-  { provider, apiKey }: Extract<ChatConnection, { kind: 'compatible' }>,
+  { provider, apiKey, reasoningEffort }: Extract<ChatConnection, { kind: 'compatible' }>,
   messages: OpenAIMessage[],
   signal: AbortSignal
 ): AsyncGenerator<MessageStreamEvent> {
@@ -34,7 +78,12 @@ export async function* streamOpenAI(
       'Content-Type': 'application/json',
       ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     },
-    body: JSON.stringify({ model: provider.model, messages, stream: true }),
+    body: JSON.stringify({
+      model: provider.model,
+      messages,
+      stream: true,
+      reasoning_effort: reasoningEffort,
+    }),
     credentials: 'omit',
     redirect: 'error',
     signal,

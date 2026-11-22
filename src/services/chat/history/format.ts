@@ -165,6 +165,7 @@ export type FileEntry = {
   /** 图片导出成功时为 ZIP 条目名，否则为 null；条目也可能不存在 */
   export_path: string | null
   is_image: boolean
+  local_only?: boolean
   width: number | null
   height: number | null
 }

@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { getChatConnection } from '../../services/settings.js'
+import { getChatConnection, useSettings } from '../../services/settings.js'
 import { isConnectionReady } from '../../services/providers.js'
 
 /** 设置弹窗的分组：通用设置 / 数据管理 */
@@ -9,10 +9,11 @@ export type SettingsSection = 'general' | 'providers' | 'data'
 export const useSettingsDialog = create(() => ({
   open: false,
   section: 'general' as SettingsSection,
+  editProviderId: undefined as string | undefined,
 }))
 
-export const openSettings = (section: SettingsSection) =>
-  useSettingsDialog.setState({ open: true, section })
+export const openSettings = (section: SettingsSection, editProviderId?: string) =>
+  useSettingsDialog.setState({ open: true, section, editProviderId })
 
 export const closeSettings = () => useSettingsDialog.setState({ open: false })
 
@@ -22,5 +23,13 @@ export const ensureApiKey = () => {
     return true
   }
   openSettings('providers')
+  return false
+}
+
+export const ensureDeepSeekKey = () => {
+  if (useSettings.getState().apiKey) {
+    return true
+  }
+  openSettings('providers', 'deepseek')
   return false
 }

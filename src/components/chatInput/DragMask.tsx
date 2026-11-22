@@ -57,18 +57,22 @@ export const useFileDrop = (onDrop: (files: File[]) => void) => {
 }
 
 /** 拖拽遮罩，挂到 body 上盖住整个页面 */
-export const DragMask = () => createPortal(<DragMaskContent />, document.body)
+export const DragMask = ({
+  count = MAX_COUNT,
+  size = MAX_SIZE_MB,
+}: {
+  count?: number
+  size?: number
+}) => createPortal(<DragMaskContent count={count} size={size} />, document.body)
 
-const DragMaskContent = () => {
+const DragMaskContent = ({ count, size }: { count: number; size: number }) => {
   const t = useTranslate()
   return (
     <div className={styles.mask}>
       <div className={styles.wrap}>
         <UploadIcon />
         <div className={styles.title}>{t('dragFileToUpload')}</div>
-        <div className={styles.desc}>
-          {t('dragFileDesc', { count: MAX_COUNT, size: MAX_SIZE_MB })}
-        </div>
+        <div className={styles.desc}>{t('dragFileDesc', { count, size })}</div>
       </div>
     </div>
   )

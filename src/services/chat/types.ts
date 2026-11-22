@@ -17,6 +17,8 @@ import type {
 export type FileAttachment = {
   id: string
   serverId: string | null
+  /** 兼容附件仅允许回传给原厂商及地址；空串表示导入后仅本地展示。 */
+  compatibleScope?: string
   /** 当前 serverId 对应的上传图片已确认符合长边限制。旧记录缺少此字段。 */
   imageSizeChecked?: boolean
   name: string

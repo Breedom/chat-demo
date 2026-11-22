@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { TranslationMessage } from '../../i18n/index.js'
 import { createId } from '../../utils/id.js'
+import { getModelOptions, type ChatConnection } from '../providers.js'
 import {
   cancelUpload,
   isImage,
@@ -10,12 +11,14 @@ import {
   type UploadTask,
 } from '../attachments.js'
 import type { FileAttachment } from './types.js'
+import { validateCompatibleFiles } from './compatibleFiles.js'
 
 export type DraftAttachment = {
   /** 本地标识，也是 IndexedDB 原件与上传任务的 key */
   id: string
   file: File
   isImage: boolean
+  nativeUpload: boolean
 }
 
 type Draft = { text: string; attachments: DraftAttachment[] }
@@ -60,12 +63,13 @@ const upload = (attachment: DraftAttachment, apiKey: string) => {
 export const addDraftFiles = (
   sessionId: string | null,
   files: File[],
-  apiKey: string
+  connection: ChatConnection
 ): TranslationMessage | null => {
   if (files.length === 0) {
     return null
   }
-  const error = validateFiles(files, getDraft(sessionId).attachments.length)
+  const existing = getDraft(sessionId).attachments
+  const error = validateDraftFiles([...existing.map((item) => item.file), ...files], connection)
   if (error) {
     return error
   }
@@ -74,10 +78,13 @@ export const addDraftFiles = (
       id: createId(),
       file,
       isImage: isImage(resolveMimeType(file)),
+      nativeUpload: connection.kind === 'deepseek',
     })
   )
   updateDraft(sessionId, (draft) => ({ ...draft, attachments: [...draft.attachments, ...added] }))
-  added.forEach((attachment) => upload(attachment, apiKey))
+  if (connection.kind === 'deepseek') {
+    added.forEach((attachment) => upload(attachment, connection.apiKey ?? ''))
+  }
   return null
 }
 
@@ -92,21 +99,46 @@ export const retryDraftAttachment = (
   }
 }
 
-/** 发送按钮和实际提交共用规则：有内容，且全部附件已上传成功。 */
-export const prepareDraftMessage = (draft: Draft, tasks: Record<string, UploadTask>) => {
+export const validateDraftFiles = (
+  files: File[],
+  connection: ChatConnection
+): TranslationMessage | null =>
+  connection.kind === 'deepseek'
+    ? validateFiles(files, 0)
+    : validateCompatibleFiles(
+        files.map((file) => ({
+          name: file.name,
+          size: file.size,
+          mimeType: resolveMimeType(file),
+        })),
+        getModelOptions(connection.provider)
+      )
+
+/** DeepSeek 的预上传任务必须完成；兼容模式在提交请求时读取附件。 */
+export const prepareDraftMessage = (
+  draft: Draft,
+  tasks: Record<string, UploadTask>,
+  connection: ChatConnection
+) => {
   const text = draft.text.trim()
-  if (!text && draft.attachments.length === 0) {
+  if (
+    (!text && draft.attachments.length === 0) ||
+    validateDraftFiles(
+      draft.attachments.map(({ file }) => file),
+      connection
+    )
+  ) {
     return null
   }
-  const files: (FileAttachment & { serverId: string; blob: Blob })[] = []
+  const files: (FileAttachment & { blob: Blob })[] = []
   for (const attachment of draft.attachments) {
     const task = tasks[attachment.id]
-    if (task?.status !== 'done' || !task.serverId) {
+    if (connection.kind === 'deepseek' && attachment.nativeUpload && task?.status !== 'done') {
       return null
     }
     files.push({
       id: attachment.id,
-      serverId: task.serverId,
+      serverId: connection.kind === 'deepseek' && task?.status === 'done' ? task.serverId : null,
       name: attachment.file.name,
       size: attachment.file.size,
       isImage: attachment.isImage,

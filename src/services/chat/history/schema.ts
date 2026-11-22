@@ -94,6 +94,7 @@ const fileEntry: Read<FileEntry> = (value) => {
     inserted_at: time(item.inserted_at),
     export_path: nullable(string)(item.export_path),
     is_image: boolean(item.is_image),
+    ...('local_only' in item ? { local_only: boolean(item.local_only) } : {}),
     width: nullable(count)(item.width),
     height: nullable(count)(item.height),
   }

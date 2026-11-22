@@ -33,7 +33,7 @@ export const VoiceButton = ({
       ? t('voiceInputStop')
       : status === 'transcribing'
         ? t('voiceInputCancel')
-        : t('voiceInput')
+        : t('providerVoiceInput')
 
   return (
     <>

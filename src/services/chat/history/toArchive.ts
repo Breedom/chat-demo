@@ -34,6 +34,7 @@ const userFragments = (message: UserMessage, exportImage: ExportImage): Fragment
       inserted_at: iso(message.createdAt),
       export_path: exportImage({ id: file.id, name: file.name, isImage }),
       is_image: isImage,
+      ...(file.compatibleScope !== undefined ? { local_only: true } : {}),
       width: null,
       height: null,
     }

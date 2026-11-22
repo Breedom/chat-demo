@@ -2,14 +2,23 @@ import clsx from 'clsx'
 import { memo, useCallback, useEffect, useLayoutEffect, useRef } from 'react'
 import {
   IconGlobeLanguageOutline14,
-  IconChevronDownOutline14,
   IconPaperclipOutline16,
   IconSendOutline16,
+  IconSettingsOutline16,
   IconStopFill16,
   IconThinkOutline14,
 } from '../base/icons.js'
-import { setSearch, setThinking, useSettings } from '../../services/settings.js'
-import { DEEPSEEK_MODEL, DEEPSEEK_PROVIDER } from '../../services/providers.js'
+import {
+  getChatConnection,
+  getReasoningChoice,
+  selectCompatibleModel,
+  setActiveProvider,
+  setReasoningChoice,
+  setSearch,
+  setThinking,
+  useSettings,
+} from '../../services/settings.js'
+import { DEEPSEEK_PROVIDER, getModelOptions, isReasoningEffort } from '../../services/providers.js'
 import { useIsMobile } from '../../app/viewport.js'
 import { sendMessage, stopReply, useChatStore } from '../../services/chat/store.js'
 import {
@@ -21,11 +30,17 @@ import {
   retryDraftAttachment,
   setDraftText,
   useDrafts,
+  validateDraftFiles,
 } from '../../services/chat/drafts.js'
+import {
+  compatibleAccept,
+  COMPATIBLE_MAX_FILES,
+  COMPATIBLE_MAX_MB,
+} from '../../services/chat/compatibleFiles.js'
 import { stopReadAloud } from '../../services/speech/readAloud.js'
 import { IconButton } from '../base/IconButton.js'
 import { Tooltip } from '../base/Tooltip.js'
-import { ensureApiKey, openSettings } from '../settings/settingsDialogState.js'
+import { ensureApiKey, ensureDeepSeekKey, openSettings } from '../settings/settingsDialogState.js'
 import { DragMask, useFileDrop } from './DragMask.js'
 import { showToast } from '../base/toastState.js'
 import { ACCEPT, useUploads } from '../../services/attachments.js'
@@ -47,7 +62,10 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const draft = useDrafts((state) => state.drafts.get(sessionId) ?? EMPTY_DRAFT)
   const { text, attachments } = draft
   const setText = (value: string) => setDraftText(sessionId, value)
-  const draftReady = useUploads((state) => prepareDraftMessage(draft, state.tasks) !== null)
+  const connection = useSettings(getChatConnection)
+  const draftReady = useUploads(
+    (state) => prepareDraftMessage(draft, state.tasks, connection) !== null
+  )
   const streaming = useChatStore(
     (state) => sessionId !== null && Object.hasOwn(state.streaming, sessionId)
   )
@@ -55,11 +73,8 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const importingHistory = useChatStore((state) => state.importingHistory)
   const isMobile = useIsMobile()
   const search = useSettings((state) => state.search)
-  const activeId = useSettings((state) => state.activeProviderId)
-  const provider = useSettings((state) =>
-    state.compatibleProviders.find(({ id }) => id === activeId)
-  )
-  const native = activeId === DEEPSEEK_PROVIDER
+  const native = connection.kind === 'deepseek'
+  const accept = native ? ACCEPT : compatibleAccept(getModelOptions(connection.provider))
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const togglesRef = useRef<HTMLDivElement>(null)
@@ -85,23 +100,22 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     if (files.length === 0 || useChatStore.getState().importingHistory) {
       return
     }
-    if (!native) {
-      showToast({ key: 'providerAttachmentsUnsupported' })
+    const selected = getChatConnection()
+    if (selected.kind === 'deepseek' && !ensureApiKey()) {
       return
     }
-    if (!ensureApiKey()) {
-      return
-    }
-    const error = addDraftFiles(sessionId, files, useSettings.getState().apiKey ?? '')
+    const error = addDraftFiles(sessionId, files, selected)
     if (error) {
       showToast(error)
     }
   }
   const retryFile = useCallback(
     (id: string) => {
-      if (useSettings.getState().activeProviderId !== DEEPSEEK_PROVIDER) {
-        showToast({ key: 'providerAttachmentsUnsupported' })
-      } else if (!useChatStore.getState().importingHistory && ensureApiKey()) {
+      if (
+        useSettings.getState().activeProviderId === DEEPSEEK_PROVIDER &&
+        !useChatStore.getState().importingHistory &&
+        ensureApiKey()
+      ) {
         retryDraftAttachment(sessionId, id, useSettings.getState().apiKey ?? '')
       }
     },
@@ -134,10 +148,9 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const cancelVoice = voice.cancel
   useEffect(() => {
     if (!native) {
-      cancelVoice()
       stopReadAloud()
     }
-  }, [native, cancelVoice])
+  }, [native])
   useEffect(
     () =>
       useChatStore.subscribe((state, previous) => {
@@ -152,22 +165,23 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const recording = voice.status === 'recording'
 
   // 排队、上传中或上传失败的附件都留在输入框，全部上传成功后才能发送
-  const canSend =
-    !importingHistory &&
-    !streaming &&
-    voice.status === 'idle' &&
-    draftReady &&
-    (native || attachments.length === 0)
+  const canSend = !importingHistory && !streaming && voice.status === 'idle' && draftReady
 
   const send = () => {
-    if (!native && getDraft(sessionId).attachments.length > 0) {
-      showToast({ key: 'providerAttachmentsUnsupported' })
+    const currentDraft = getDraft(sessionId)
+    const selected = getChatConnection()
+    const fileError = validateDraftFiles(
+      currentDraft.attachments.map(({ file }) => file),
+      selected
+    )
+    if (fileError) {
+      showToast(fileError)
       return
     }
     if (
       useChatStore.getState().importingHistory ||
       voice.status !== 'idle' ||
-      !prepareDraftMessage(getDraft(sessionId), useUploads.getState().tasks)
+      !prepareDraftMessage(currentDraft, useUploads.getState().tasks, selected)
     ) {
       return
     }
@@ -192,7 +206,12 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
         }
       }}
     >
-      <DraftAttachments items={attachments} onRetry={retryFile} onRemove={removeFile} />
+      <DraftAttachments
+        items={attachments}
+        native={native}
+        onRetry={retryFile}
+        onRemove={removeFile}
+      />
       <div className={styles.textareaWrapper}>
         <textarea
           ref={textareaRef}
@@ -231,16 +250,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
         </div>
       </div>
       <div className={styles.functionRow}>
-        <button
-          type="button"
-          className={styles.providerButton}
-          title={`${provider?.name ?? 'DeepSeek'} · ${provider?.model ?? DEEPSEEK_MODEL}`}
-          aria-label={`${t('providerSettings')}: ${provider?.name ?? 'DeepSeek'}`}
-          onClick={() => openSettings('providers')}
-        >
-          <span>{provider?.name ?? 'DeepSeek'}</span>
-          <IconChevronDownOutline14 />
-        </button>
+        <ModelControls />
         {/* 深度思考 / 智能搜索开关，tooltip 在按钮上方 */}
         {native ? (
           <div ref={togglesRef} className={styles.toggles}>
@@ -271,35 +281,35 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           </div>
         ) : null}
         <div className={styles.right}>
-          {native ? (
+          <VoiceButton
+            status={voice.status}
+            disabled={!voice.available}
+            seconds={voice.seconds}
+            onClick={() => {
+              if (
+                voice.status !== 'idle' ||
+                (!useChatStore.getState().importingHistory && ensureDeepSeekKey())
+              ) {
+                void voice.toggle()
+              }
+            }}
+          />
+          {accept ? (
             <>
-              <VoiceButton
-                status={voice.status}
-                disabled={!voice.available}
-                seconds={voice.seconds}
-                onClick={() => {
-                  if (
-                    voice.status !== 'idle' ||
-                    (!useChatStore.getState().importingHistory && ensureApiKey())
-                  ) {
-                    void voice.toggle()
-                  }
-                }}
-              />
               <IconButton
                 size="m"
                 tone="primary"
                 icon={<IconPaperclipOutline16 />}
                 tooltip={t('uploadFile')}
                 disabled={importingHistory}
-                onClick={() => ensureApiKey() && fileInputRef.current?.click()}
+                onClick={() => (!native || ensureApiKey()) && fileInputRef.current?.click()}
               />
               <input
                 ref={fileInputRef}
                 type="file"
                 multiple
                 hidden
-                accept={ACCEPT}
+                accept={accept}
                 onChange={(event) => {
                   acceptFiles(Array.from(event.target.files ?? []))
                   event.target.value = ''
@@ -332,7 +342,83 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           )}
         </div>
       </div>
-      {native && dragging ? <DragMask /> : null}
+      {accept && dragging ? (
+        <DragMask {...(native ? {} : { count: COMPATIBLE_MAX_FILES, size: COMPATIBLE_MAX_MB })} />
+      ) : null}
+    </div>
+  )
+}
+
+const ModelControls = () => {
+  const t = useTranslate()
+  const connection = useSettings(getChatConnection)
+  const providers = useSettings((state) => state.compatibleProviders)
+  const provider = connection.kind === 'compatible' ? connection.provider : null
+  const selected = provider ? JSON.stringify([provider.id, provider.model]) : DEEPSEEK_PROVIDER
+  const options = provider ? getModelOptions(provider) : null
+  const effort = useSettings((state) =>
+    provider ? getReasoningChoice(provider, state) : 'default'
+  )
+  const models = providers.flatMap((entry) =>
+    [...new Set([entry.model, ...(entry.models?.map(({ id }) => id) ?? [])])].map((model) => ({
+      id: JSON.stringify([entry.id, model]),
+      label: `${entry.name} · ${model}`,
+      choose: () => selectCompatibleModel(entry.id, model),
+    }))
+  )
+  return (
+    <div className={styles.modelControls}>
+      <select
+        className={styles.providerSelect}
+        aria-label={t('providerChooseModel')}
+        title={
+          provider
+            ? `${provider.name} · ${provider.model}`
+            : `DeepSeek · ${connection.kind === 'deepseek' ? connection.model : ''}`
+        }
+        value={selected}
+        onChange={(event) => {
+          const value = event.target.value
+          if (value === DEEPSEEK_PROVIDER) {
+            setActiveProvider(value)
+          } else {
+            models.find((item) => item.id === value)?.choose()
+          }
+        }}
+      >
+        <option value={DEEPSEEK_PROVIDER}>DeepSeek</option>
+        {models.map(({ id, label }) => (
+          <option key={id} value={id}>
+            {label}
+          </option>
+        ))}
+      </select>
+      <IconButton
+        icon={<IconSettingsOutline16 />}
+        tooltip={t('providerSettings')}
+        onClick={() => openSettings('providers')}
+      />
+      {provider && options?.efforts.length ? (
+        <select
+          className={styles.reasoningSelect}
+          aria-label={t('providerReasoning')}
+          title={t('providerReasoning')}
+          value={effort}
+          onChange={(event) => {
+            const choice = event.target.value
+            if (choice === 'default' || isReasoningEffort(choice)) {
+              setReasoningChoice(provider, choice)
+            }
+          }}
+        >
+          <option value="default">{t('reasoning_default')}</option>
+          {options.efforts.map((level) => (
+            <option key={level} value={level}>
+              {t(`reasoning_${level}`)}
+            </option>
+          ))}
+        </select>
+      ) : null}
     </div>
   )
 }

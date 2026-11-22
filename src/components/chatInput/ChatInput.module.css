@@ -5,6 +5,7 @@
   flex-direction: column;
   box-sizing: border-box;
   width: 100%;
+  container-type: inline-size;
   cursor: text;
   font-size: 16px;
   line-height: var(--line-height);
@@ -243,19 +244,23 @@
   padding: 12px;
 }
 
-.providerButton {
-  display: inline-flex;
-  flex: 0 1 auto;
+.modelControls {
+  display: flex;
   align-items: center;
   gap: 4px;
+  flex: 0 1 auto;
   min-width: 0;
-  max-width: 140px;
-  min-height: 32px;
+}
+
+.providerSelect,
+.reasoningSelect {
+  min-width: 0;
+  height: 32px;
   padding: 0 6px;
-  border: 0;
+  border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 8px;
-  background: none;
-  color: var(--dsw-alias-brand-text);
+  background-color: var(--dsw-specific-input-major);
+  color: var(--dsw-alias-label-primary);
   font: inherit;
   font-size: 13px;
   cursor: pointer;
@@ -263,15 +268,31 @@
   &:hover {
     background: var(--dsw-alias-interactive-bg-hover);
   }
+}
 
-  span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+.providerSelect {
+  width: 170px;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
+.reasoningSelect {
+  flex: 0 0 104px;
+  width: 104px;
+}
+
+@container (max-width: 520px) {
+  .functionRow {
+    flex-wrap: wrap;
+    row-gap: 6px;
   }
 
-  svg {
-    flex-shrink: 0;
+  .modelControls {
+    flex: 0 0 100%;
+  }
+
+  .providerSelect {
+    flex: 1;
   }
 }
 

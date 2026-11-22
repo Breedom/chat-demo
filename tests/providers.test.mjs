@@ -11,14 +11,25 @@ Object.defineProperty(globalThis, 'localStorage', {
 })
 globalThis.__API_ORIGIN__ = 'https://deepseek.example'
 
-const { normalizeBaseUrl, OPENAI_PRESET, isConnectionReady } =
+const { normalizeBaseUrl, OPENAI_PRESET, isConnectionReady, attachmentScope, getModelOptions } =
   await import('../.cache/test-build/src/services/providers.js')
-const { getChatConnection, saveCompatibleProvider, removeCompatibleProvider, setActiveProvider } =
-  await import('../.cache/test-build/src/services/settings.js')
-const { streamOpenAI } = await import('../.cache/test-build/src/services/api/openai.js')
+const {
+  getChatConnection,
+  saveCompatibleProvider,
+  removeCompatibleProvider,
+  setActiveProvider,
+  selectCompatibleModel,
+  setReasoningChoice,
+} = await import('../.cache/test-build/src/services/settings.js')
+const { streamOpenAI, listModelIds } =
+  await import('../.cache/test-build/src/services/api/openai.js')
 const { streamMessage } = await import('../.cache/test-build/src/services/api/client.js')
 const { applyEvent, toOpenAIRequestMessages } =
   await import('../.cache/test-build/src/services/chat/reply.js')
+const { prepareCompatibleContent, validateCompatibleFiles } =
+  await import('../.cache/test-build/src/services/chat/compatibleFiles.js')
+const { addDraftFiles, getDraft, prepareDraftMessage, clearDraft } =
+  await import('../.cache/test-build/src/services/chat/drafts.js')
 
 const connection = {
   kind: 'compatible',
@@ -43,6 +54,143 @@ const response = (frames) =>
       headers: { 'Content-Type': 'text/event-stream' },
     }
   )
+
+const mediaProvider = {
+  id: 'media',
+  name: 'Media API',
+  model: 'vision',
+  baseUrl: 'https://media.example/v1',
+  models: [
+    {
+      id: 'vision',
+      images: true,
+      videos: true,
+      files: true,
+      efforts: ['low', 'high'],
+      defaultEffort: 'low',
+    },
+    { id: 'text', images: false, efforts: ['medium'], defaultEffort: 'medium' },
+  ],
+}
+
+test('fetches model IDs from unsaved settings, deduplicates and validates the response', async (t) => {
+  let valid = true
+  t.mock.method(globalThis, 'fetch', async (url, init) => {
+    assert.equal(url, 'https://models.example/gateway/v1/models')
+    assert.equal(init.headers.Authorization, 'Bearer temporary-key')
+    assert.equal(init.redirect, 'error')
+    return Response.json(
+      valid ? { data: [{ id: 'z' }, { id: 'a' }, { id: ' z ' }, { id: 1 }] } : {}
+    )
+  })
+  const signal = new AbortController().signal
+  const fetchIds = () =>
+    listModelIds('https://models.example/gateway/v1/models', ' temporary-key ', signal)
+  assert.deepEqual(await fetchIds(), ['a', 'z'])
+  valid = false
+  await assert.rejects(fetchIds, { kind: 'protocol' })
+  await assert.rejects(() => listModelIds('https://api.openai.com/v1', '', signal), {
+    kind: 'protocol',
+  })
+})
+
+test('separates capabilities and chat reasoning overrides by model', async (t) => {
+  assert.ok(saveCompatibleProvider(mediaProvider, ''))
+  assert.equal(getChatConnection().reasoningEffort, 'low')
+  setReasoningChoice(mediaProvider, 'high')
+  selectCompatibleModel('media', 'text')
+  const text = getChatConnection()
+  assert.equal(text.reasoningEffort, 'medium')
+  assert.equal(getModelOptions(text.provider).images, false)
+  selectCompatibleModel('media', 'vision')
+  const vision = getChatConnection()
+  assert.equal(vision.reasoningEffort, 'high')
+  let body
+  t.mock.method(globalThis, 'fetch', async (_, init) => {
+    body = JSON.parse(init.body)
+    return response([{ choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] }, '[DONE]'])
+  })
+  await collect(streamOpenAI(vision, messages, new AbortController().signal))
+  assert.equal(body.reasoning_effort, 'high')
+  setReasoningChoice(mediaProvider, 'default')
+  await collect(streamOpenAI(getChatConnection(), messages, new AbortController().signal))
+  assert.ok(!Object.hasOwn(body, 'reasoning_effort'))
+  removeCompatibleProvider('media')
+})
+
+test('stages compatible files locally and encodes supported attachments in the request', async (t) => {
+  const conn = { kind: 'compatible', provider: mediaProvider, apiKey: null }
+  const mock = t.mock.method(globalThis, 'fetch', () => {
+    throw new Error('Unexpected upload')
+  })
+  const files = [
+    new File(['png'], 'sample.png'),
+    new File(['movie'], 'sample.mp4'),
+    new File(['pdf'], 'sample.pdf'),
+    new File(['你好'], 'sample.txt'),
+  ]
+  assert.equal(addDraftFiles('media-test', files, conn), null)
+  assert.equal(mock.mock.callCount(), 0)
+  const prepared = prepareDraftMessage(getDraft('media-test'), {}, conn)
+  assert.equal(prepared.files.length, 4)
+  assert.ok(prepared.files.every((file) => file.serverId === null))
+  const blobs = new Map(prepared.files.map(({ id, blob }) => [id, blob]))
+  const current = {
+    ...question,
+    files: prepared.files.map((file) => ({
+      ...file,
+      compatibleScope: attachmentScope(mediaProvider),
+    })),
+  }
+  const converted = await prepareCompatibleContent(
+    mediaProvider,
+    [],
+    current,
+    async (id) => blobs.get(id),
+    new AbortController().signal
+  )
+  assert.deepEqual(converted.current, [
+    { type: 'text', text: question.content },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,cG5n' } },
+    { type: 'video_url', video_url: { url: 'data:video/mp4;base64,bW92aWU=' } },
+    {
+      type: 'file',
+      file: { filename: 'sample.pdf', file_data: 'data:application/pdf;base64,cGRm' },
+    },
+    { type: 'text', text: 'sample.txt:\n你好' },
+  ])
+  assert.equal(
+    validateCompatibleFiles(current.files, getModelOptions({ ...mediaProvider, model: 'text' }))
+      .key,
+    'providerAttachmentsUnsupported'
+  )
+  clearDraft('media-test')
+})
+
+test('keeps mismatched and restored attachments out of other providers’ requests', async () => {
+  const original = { ...mediaProvider, baseUrl: 'https://old.example/v1' }
+  const file = {
+    id: 'private',
+    name: 'private.png',
+    size: 1,
+    mimeType: 'image/png',
+    compatibleScope: attachmentScope(original),
+  }
+  const previous = [
+    { content: 'Only this text', files: [file] },
+    { content: '', files: [{ ...file, compatibleScope: '' }] },
+  ]
+  const load = async () => {
+    throw new Error('Should not read another provider’s attachment')
+  }
+  const signal = new AbortController().signal
+  const converted = await prepareCompatibleContent(mediaProvider, previous, question, load, signal)
+  assert.deepEqual(converted.history, ['Only this text', ''])
+  await assert.rejects(
+    () => prepareCompatibleContent(mediaProvider, [], { ...question, files: [file] }, load, signal),
+    { kind: 'protocol' }
+  )
+})
 
 test('validates base URLs and keeps each compatible key out of persistent settings', () => {
   assert.equal(
